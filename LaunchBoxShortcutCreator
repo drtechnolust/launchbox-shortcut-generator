@@ -1,0 +1,770 @@
+<#
+.SYNOPSIS
+    LaunchBox Shortcut Generator for Windows Games .exe files 
+
+.DESCRIPTION
+    This PowerShell script automatically scans game collection folders and creates 
+    Windows shortcuts to the main executable for each game. It uses an intelligent 
+    scoring system to identify the correct executable and handles complex folder 
+    structures commonly found in modern games.
+
+.FEATURES
+    - Smart executable detection with advanced scoring algorithm
+    - User input for custom folder paths with validation
+    - Progressive depth searching for performance optimization
+    - Comprehensive logging system with multiple log files
+    - Timeout protection to prevent hanging on large directories
+    - Duplicate prevention and existing shortcut detection
+    - Special handling for known game engines (Unreal Engine, etc.)
+    - Filename sanitization for Windows compatibility
+
+.AUTHOR
+    Dr.Technolust
+    
+.LICENSE
+    MIT License - See license section at bottom of script
+
+.VERSION
+    2.0 - Enhanced with user input and improved commenting
+#>
+
+#==============================================================================
+# MIT LICENSE
+#==============================================================================
+<#
+MIT License
+
+Copyright (c) 2025 LaunchBox Shortcut Generator Contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+#>
+
+#==============================================================================
+# SCRIPT CONFIGURATION AND USER INPUT
+#==============================================================================
+
+# Get user input for the root game folder with validation
+Write-Host "=== LaunchBox Shortcut Generator ===" -ForegroundColor Cyan
+Write-Host "This script will scan your game folders and create shortcuts to main executables." -ForegroundColor White
+Write-Host ""
+
+do {
+    $rootGameFolder = Read-Host "Enter the path to your games folder"
+    
+    # Validate user input
+    if (-not $rootGameFolder) {
+        Write-Host "Please enter a valid path." -ForegroundColor Red
+        continue
+    }
+    
+    # Remove quotes if user included them (common when copy-pasting paths)
+    $rootGameFolder = $rootGameFolder.Trim('"')
+    
+    # Check if path exists
+    if (-not (Test-Path $rootGameFolder)) {
+        Write-Host "Path does not exist: $rootGameFolder" -ForegroundColor Red
+        Write-Host "Please enter a valid folder path." -ForegroundColor Yellow
+        continue
+    }
+    
+    # Check if it's actually a directory (not a file)
+    if (-not (Get-Item $rootGameFolder).PSIsContainer) {
+        Write-Host "Path is not a directory: $rootGameFolder" -ForegroundColor Red
+        continue
+    }
+    
+    # If we get here, the path is valid
+    break
+} while ($true)
+
+Write-Host "Scanning folder: $rootGameFolder" -ForegroundColor Green
+
+#==============================================================================
+# SCRIPT CONFIGURATION VARIABLES
+#==============================================================================
+
+# Set up paths and configuration
+$shortcutOutputFolder = "$rootGameFolder\Shortcuts"     # Where shortcuts will be saved
+$maxDepth = 8                                           # Maximum folder depth to search (increased for complex game structures)
+$folderTimeout = 300                                    # Maximum seconds to spend scanning each game folder
+
+# Define log file paths for comprehensive tracking
+$logFound = "$shortcutOutputFolder\FoundGames.log"        # Successfully processed games
+$logNotFound = "$shortcutOutputFolder\NotFoundGames.log"  # Games where no executable was found
+$logSkipped = "$shortcutOutputFolder\SkippedGames.log"    # Games that were skipped (duplicates, existing shortcuts)
+$logErrors = "$shortcutOutputFolder\ErrorGames.log"      # Games that encountered errors
+$logBlocked = "$shortcutOutputFolder\BlockedFiles.log"   # Files blocked by filters (for debugging)
+
+#==============================================================================
+# INITIALIZATION
+#==============================================================================
+
+# Ensure shortcut output folder exists
+if (!(Test-Path $shortcutOutputFolder)) {
+    New-Item -ItemType Directory -Path $shortcutOutputFolder | Out-Null
+    Write-Host "Created shortcuts folder: $shortcutOutputFolder" -ForegroundColor Yellow
+}
+
+# Clear existing log files to start fresh
+Remove-Item -Path $logFound, $logNotFound, $logSkipped, $logErrors, $logBlocked -ErrorAction SilentlyContinue
+
+# Store a hashtable of created shortcuts to prevent duplicates
+$createdShortcuts = @{}
+
+#==============================================================================
+# CORE FUNCTIONS
+#==============================================================================
+
+<#
+.SYNOPSIS
+    Calculates a score for an executable to determine if it's likely the main game executable
+
+.DESCRIPTION
+    Uses multiple criteria to score executables:
+    - Exact folder name matches get highest priority (1000 points)
+    - Unreal Engine shipping executables get high priority (500 points)
+    - Files with "game" in the name get bonus points
+    - Executables in common game folders get bonus points
+    - Known problematic files are blocked (return -1)
+
+.PARAMETER exePath
+    Full path to the executable file
+
+.PARAMETER gameFolderName
+    Name of the game folder (used for matching)
+
+.OUTPUTS
+    Integer score (higher = more likely to be main executable, -1 = blocked)
+#>
+function Get-ExecutableScore {
+    param($exePath, $gameFolderName)
+    
+    # Extract filename without extension and convert to lowercase for comparison
+    $exeName = [System.IO.Path]::GetFileNameWithoutExtension($exePath).ToLower()
+    $folderName = $gameFolderName.ToLower()
+    $score = 0
+    
+    #--------------------------------------------------------------------------
+    # PHASE 1: BLOCKING FILTERS - Block problematic files
+    #--------------------------------------------------------------------------
+    
+    # Block files with problematic patterns anywhere in the name
+    $blockPatterns = @(
+        "*uninstall*", "*setup*", "*settings*", "*helper*",
+        "*config*", "*launcher*", "*language*", "*crash*", 
+        "*test*", "*service*", "*server*", "*update*", "*install*"
+    )
+    
+    foreach ($pattern in $blockPatterns) {
+        if ($exeName -like $pattern) {
+            # Log blocked files for debugging purposes
+            "$gameFolderName - BLOCKED by pattern '$pattern': $exePath" | Out-File -FilePath $logBlocked -Append
+            return -1  # Negative score means "do not use this file"
+        }
+    }
+    
+    # Enhanced blacklist of known non-game executables
+    $badNames = @(
+        "unins000",                                          # Uninstaller
+        "crashreport", "errorreport", "crashreporter", "crashpad",  # Crash reporters
+        "redist", "redistributable", "vcredist", "vc_redist",       # Redistributables
+        "directx", "dxwebsetup",                             # DirectX installers
+        "uploader", "webhelper",                             # Helper applications
+        "crs-handler", "crs-uploader", "crs-video",         # Crash reporting system
+        "drivepool", "quicksfv", "handler",                  # Utility applications
+        "gamingrepair", "unitycrashhandle64"                 # Gaming/Unity utilities
+    )
+    
+    if ($badNames -contains $exeName) {
+        # Log blocked files for debugging
+        "$gameFolderName - BLOCKED by blacklist: $exePath" | Out-File -FilePath $logBlocked -Append
+        return -1
+    }
+    
+    #--------------------------------------------------------------------------
+    # PHASE 2: POSITIVE SCORING - Award points for good indicators
+    #--------------------------------------------------------------------------
+    
+    # HIGHEST PRIORITY: Exact match with folder name gets maximum score
+    if ($exeName -eq $folderName) { 
+        return 1000  # Guaranteed highest score - this is almost certainly the main executable
+    }
+    
+    # HIGH PRIORITY: Check for Unreal Engine shipping executables
+    # Pattern: "gamename-win64-shipping.exe"
+    $shippingPattern = "$folderName-win64-shipping"
+    if ($exeName -eq $shippingPattern) {
+        return 500  # Very high score, but less than exact match
+    }
+    
+    # Check for variations of shipping executables
+    if ($exeName -like "*$folderName*" -and $exeName -like "*win64*shipping*") {
+        $score += 100
+    }
+    
+    # ENHANCED: Check for "game" anywhere in executable name
+    # This fixes executables like "gsgameexe.exe", "gameexe.exe", etc.
+    if ($exeName -like "*game*") { 
+        $score += 75  # High bonus for any game-related executable
+    }
+    
+    # Partial match with folder name is promising
+    if ($exeName -like "*$folderName*") { 
+        $score += 50 
+    }
+    
+    # Check individual words from game name
+    $gameNameParts = $folderName -split ' '
+    foreach ($part in $gameNameParts) {
+        if ($part.Length -gt 3 -and $exeName -like "*$part*") {
+            $score += 20  # Bonus for each significant word match
+        }
+    }
+    
+    # Priority executable names (common game executable names)
+    $priorityNames = @("start", "play", "run", "main", "bin")
+    if ($priorityNames -contains $exeName) { 
+        $score += 30 
+    }
+    
+    # Bonus for executables in typical game folders
+    $exeLocation = [System.IO.Path]::GetDirectoryName($exePath).ToLower()
+    $goodPaths = @("\bin", "\binaries", "\game", "\app", "\win64", "\win32", "\windows", "\x64", "\x86")
+    foreach ($goodPath in $goodPaths) {
+        if ($exeLocation -like "*$goodPath*") {
+            $score += 20
+            break  # Only award this bonus once
+        }
+    }
+    
+    # Slight penalty for extremely deep folder structures
+    # (may indicate utility/helper files rather than main executable)
+    $folderDepth = ($exePath.Split('\').Count - $rootGameFolder.Split('\').Count)
+    if ($folderDepth -gt 6) {
+        $score -= 10
+    }
+    
+    return $score
+}
+
+<#
+.SYNOPSIS
+    Creates a Windows shortcut (.lnk file) to the specified executable
+
+.DESCRIPTION
+    Creates a shortcut with proper sanitization of filenames and duplicate detection.
+    Handles various edge cases like existing shortcuts, illegal characters, and long names.
+
+.PARAMETER targetExe
+    Full path to the target executable
+
+.PARAMETER shortcutName
+    Desired name for the shortcut (will be sanitized)
+
+.PARAMETER outputFolder
+    Folder where the shortcut should be created
+
+.OUTPUTS
+    String indicating the result: "created", "created_sanitized", "exists_same", "exists_different", "duplicate", "error"
+#>
+function Create-Shortcut {
+    param (
+        [string]$targetExe,
+        [string]$shortcutName,
+        [string]$outputFolder
+    )
+    
+    # Sanitize the shortcut name by removing/replacing problematic characters
+    $safeShortcutName = $shortcutName -replace '[\\\/\:\*\?"<>\|]', '_'  # Replace illegal filename characters
+    $safeShortcutName = $safeShortcutName -replace '&', 'and'           # Replace & with 'and' for better compatibility
+    
+    # Limit filename length to prevent "path too long" errors
+    if ($safeShortcutName.Length -gt 50) {
+        $safeShortcutName = $safeShortcutName.Substring(0, 47) + "..."
+    }
+    
+    # Construct the full shortcut path
+    $shortcutPath = "$outputFolder\$safeShortcutName.lnk"
+    
+    # Check if the shortcut already exists and what it points to
+    if (Test-Path $shortcutPath) {
+        try {
+            $WScriptShell = New-Object -ComObject WScript.Shell
+            $existingShortcut = $WScriptShell.CreateShortcut($shortcutPath)
+            $existingTarget = $existingShortcut.TargetPath
+            
+            if ($existingTarget -eq $targetExe) {
+                return "exists_same"      # Shortcut exists and points to same executable
+            } else {
+                return "exists_different" # Shortcut exists but points to different executable
+            }
+        } catch {
+            Write-Host "Error checking existing shortcut: $_" -ForegroundColor Yellow
+            return "error"
+        }
+    }
+    
+    # Check if we've already created a shortcut to this executable
+    # (prevents multiple shortcuts to the same game executable)
+    if ($createdShortcuts.ContainsKey($targetExe)) {
+        return "duplicate"
+    }
+    
+    # Attempt to create the shortcut
+    try {
+        $WScriptShell = New-Object -ComObject WScript.Shell
+        $shortcut = $WScriptShell.CreateShortcut($shortcutPath)
+        $shortcut.TargetPath = $targetExe
+        $shortcut.WorkingDirectory = [System.IO.Path]::GetDirectoryName($targetExe)  # Set working directory to exe location
+        $shortcut.Save()
+        
+        # Add to our tracking hashtable to prevent duplicates
+        $createdShortcuts[$targetExe] = $shortcutName
+        
+        return "created"
+    } catch {
+        # If creation fails, try more aggressive sanitization
+        try {
+            $ultraSafeShortcutName = "Game_" + ($shortcutName -replace '[^a-zA-Z0-9]', '_')
+            if ($ultraSafeShortcutName.Length -gt 30) {
+                $ultraSafeShortcutName = $ultraSafeShortcutName.Substring(0, 30)
+            }
+            
+            $shortcutPath = "$outputFolder\$ultraSafeShortcutName.lnk"
+            $WScriptShell = New-Object -ComObject WScript.Shell
+            $shortcut = $WScriptShell.CreateShortcut($shortcutPath)
+            $shortcut.TargetPath = $targetExe
+            $shortcut.WorkingDirectory = [System.IO.Path]::GetDirectoryName($targetExe)
+            $shortcut.Save()
+            
+            # Add to our tracking hashtable
+            $createdShortcuts[$targetExe] = $shortcutName
+            
+            return "created_sanitized"  # Created with heavily sanitized name
+        } catch {
+            Write-Host "Error creating shortcut for $shortcutName`: $_" -ForegroundColor Yellow
+            return "error"
+        }
+    }
+}
+
+<#
+.SYNOPSIS
+    Formats a TimeSpan object into a readable string format
+
+.DESCRIPTION
+    Converts TimeSpan to human-readable format (h:mm:ss or mm:ss)
+
+.PARAMETER TimeSpan
+    TimeSpan object to format
+
+.OUTPUTS
+    Formatted time string
+#>
+function Format-TimeSpan {
+    param ([TimeSpan]$TimeSpan)
+    
+    if ($TimeSpan.TotalHours -ge 1) {
+        return "{0:h\:mm\:ss}" -f $TimeSpan    # Include hours if >= 1 hour
+    } else {
+        return "{0:mm\:ss}" -f $TimeSpan       # Just minutes and seconds
+    }
+}
+
+<#
+.SYNOPSIS
+    Searches for executable files in a game folder using optimized strategies
+
+.DESCRIPTION
+    Uses a multi-phase search approach:
+    1. Check common game folder patterns first (fastest)
+    2. Progressive depth searching if needed
+    3. Full recursive search as last resort (with timeout protection)
+
+.PARAMETER folderPath
+    Path to the game folder to search
+
+.PARAMETER maxDepth
+    Maximum folder depth for searching
+
+.PARAMETER gameName
+    Name of the game (for logging)
+
+.PARAMETER timeout
+    Maximum seconds to spend searching this folder
+
+.OUTPUTS
+    Array of FileInfo objects for found executables
+#>
+function Find-Executables {
+    param (
+        [string]$folderPath,
+        [int]$maxDepth,
+        [string]$gameName,
+        [int]$timeout
+    )
+    
+    # Show progress for the current search
+    Write-Progress -Id 2 -Activity "Finding executables" -Status "Scanning $gameName..."
+    
+    $exeFiles = @()
+    
+    try {
+        #----------------------------------------------------------------------
+        # PHASE 1: Check common game folder structures first (performance optimization)
+        #----------------------------------------------------------------------
+        
+        $commonGamePaths = @(
+            "$folderPath\Game\*.exe",           # Common for many games
+            "$folderPath\app\*.exe",            # Steam apps
+            "$folderPath\bin\*.exe",            # Binary folder
+            "$folderPath\binaries\*.exe",       # Binaries folder
+            "$folderPath\Windows\*.exe",        # Windows-specific builds
+            "$folderPath\x64\*.exe",            # 64-bit builds
+            "$folderPath\Win64\*.exe",          # Windows 64-bit
+            "$folderPath\executable\*.exe",     # Executable folder
+            "$folderPath\program\*.exe",        # Program folder
+            "$folderPath\launcher\*.exe",       # Launcher folder
+            "$folderPath\main\*.exe"            # Main folder
+        )
+        
+        # Search common paths first - much faster than recursive search
+        foreach ($path in $commonGamePaths) {
+            if (Test-Path $path) {
+                $foundExes = Get-ChildItem -Path $path -ErrorAction SilentlyContinue
+                if ($foundExes -and $foundExes.Count -gt 0) {
+                    Write-Host "Found executables in common path: $path" -ForegroundColor Green
+                    $exeFiles += $foundExes
+                }
+            }
+        }
+        
+        #----------------------------------------------------------------------
+        # PHASE 2: Check deeper common structures (Unreal Engine, Unity, etc.)
+        #----------------------------------------------------------------------
+        
+        $deeperCommonPaths = @(
+            "$folderPath\Engine\Binaries\Win64\*.exe",      # Unreal Engine
+            "$folderPath\Binaries\Win64\*.exe",             # Unreal Engine (alternate)
+            "$folderPath\*\Binaries\Win64\*.exe",           # Unreal Engine (one level deeper)
+            "$folderPath\*\*\Binaries\Win64\*.exe",         # Unreal Engine (two levels deeper)
+            "$folderPath\*\*\*\Binaries\Win64\*.exe"        # Unreal Engine (three levels deeper)
+        )
+        
+        # Only search deeper if we haven't found anything yet
+        foreach ($path in $deeperCommonPaths) {
+            if ($exeFiles.Count -eq 0) {
+                try {
+                    $foundExes = Get-ChildItem -Path $path -ErrorAction SilentlyContinue
+                    if ($foundExes -and $foundExes.Count -gt 0) {
+                        Write-Host "Found executables in deeper path: $path" -ForegroundColor Green
+                        $exeFiles += $foundExes
+                    }
+                } catch {
+                    # Continue if path is invalid - this is expected for wildcard paths
+                }
+            }
+        }
+        
+        # If we found executables in common paths, we're done (performance optimization)
+        if ($exeFiles.Count -gt 0) {
+            Write-Progress -Id 2 -Activity "Finding executables" -Status "Found executables in common paths" -Completed
+            return $exeFiles
+        }
+        
+        #----------------------------------------------------------------------
+        # PHASE 3: Progressive depth searching (if common paths didn't work)
+        #----------------------------------------------------------------------
+        
+        # Try progressively deeper searches to balance speed vs. thoroughness
+        
+        # Level 0: Root level only
+        $exeFiles = Get-ChildItem -Path $folderPath -Filter "*.exe" -File -ErrorAction SilentlyContinue
+        
+        # Level 1: One level deep
+        if ($exeFiles.Count -eq 0) {
+            $exeFiles = Get-ChildItem -Path $folderPath -Filter "*.exe" -File -Depth 1 -ErrorAction SilentlyContinue
+        }
+        
+        # Level 2: Two levels deep
+        if ($exeFiles.Count -eq 0) {
+            $exeFiles = Get-ChildItem -Path $folderPath -Filter "*.exe" -File -Depth 2 -ErrorAction SilentlyContinue
+        }
+        
+        # Level 4: Four levels deep
+        if ($exeFiles.Count -eq 0) {
+            $exeFiles = Get-ChildItem -Path $folderPath -Filter "*.exe" -File -Depth 4 -ErrorAction SilentlyContinue
+        }
+        
+        # Max depth: Use configured maximum depth
+        if ($exeFiles.Count -eq 0) {
+            $exeFiles = Get-ChildItem -Path $folderPath -Filter "*.exe" -File -Depth $maxDepth -ErrorAction SilentlyContinue
+        }
+        
+        #----------------------------------------------------------------------
+        # PHASE 4: Full recursive search with timeout protection (last resort)
+        #----------------------------------------------------------------------
+        
+        if ($exeFiles.Count -eq 0) {
+            # Use PowerShell jobs for timeout protection
+            $scriptBlock = {
+                param($path)
+                Get-ChildItem -Path $path -Filter "*.exe" -File -Recurse -ErrorAction SilentlyContinue
+            }
+            
+            # Start the search as a background job
+            $job = Start-Job -ScriptBlock $scriptBlock -ArgumentList $folderPath
+            
+            # Wait for job to complete or timeout (leave 5 seconds buffer)
+            $null = Wait-Job -Job $job -Timeout ($timeout - 5)
+            
+            # Check if job completed or timed out
+            if ($job.State -eq "Running") {
+                Stop-Job -Job $job
+                Write-Host "Timeout reached while scanning $gameName recursively." -ForegroundColor Yellow
+            } else {
+                $exeFiles = Receive-Job -Job $job
+            }
+            
+            # Clean up the job
+            Remove-Job -Job $job -Force
+        }
+    }
+    catch {
+        Write-Host "Error scanning $folderPath for executables: $_" -ForegroundColor Red
+    }
+    
+    # Clear the progress indicator
+    Write-Progress -Id 2 -Activity "Finding executables" -Completed
+    return $exeFiles
+}
+
+#==============================================================================
+# MAIN PROCESSING LOOP
+#==============================================================================
+
+# Get list of game folders to process
+Write-Host "Checking for game folders..." -ForegroundColor Yellow
+$gameFolders = Get-ChildItem -Path $rootGameFolder -Directory
+
+# Validate that we found game folders
+if ($gameFolders.Count -eq 0) {
+    Write-Host "No subdirectories found in $rootGameFolder" -ForegroundColor Red
+    Write-Host "Make sure the path contains game folders to scan." -ForegroundColor Yellow
+    Read-Host "Press Enter to exit"
+    exit
+}
+
+# Initialize counters and timing
+$total = $gameFolders.Count
+$index = 0
+$created = 0          # Successfully created shortcuts
+$skipped = 0          # Skipped (duplicates, existing shortcuts)
+$notFound = 0         # No executable found
+$sanitized = 0        # Created with sanitized names
+$errors = 0           # Errors during processing
+$timeouts = 0         # Folders that hit timeout
+
+# Start timing for progress estimation
+$startTime = Get-Date
+$lastUpdateTime = $startTime
+
+Write-Host "Starting to process $total game folders..." -ForegroundColor Green
+
+#==============================================================================
+# PROCESS EACH GAME FOLDER
+#==============================================================================
+
+foreach ($folder in $gameFolders) {
+    $index++
+    $gameName = $folder.Name
+    
+    #--------------------------------------------------------------------------
+    # Progress tracking and time estimation
+    #--------------------------------------------------------------------------
+    
+    $currentTime = Get-Date
+    $elapsedTime = $currentTime - $startTime
+    $itemsRemaining = $total - $index
+    
+    # Update time estimates every 5 items or every 10 seconds to avoid fluctuations
+    if (($index % 5 -eq 0) -or (($currentTime - $lastUpdateTime).TotalSeconds -ge 10)) {
+        $lastUpdateTime = $currentTime
+        
+        if ($index -gt 1) {  # Need at least 2 items to calculate average time
+            $averageTimePerItem = $elapsedTime.TotalSeconds / ($index - 1)
+            $estimatedTimeRemaining = [TimeSpan]::FromSeconds($averageTimePerItem * $itemsRemaining)
+            $formattedTimeRemaining = Format-TimeSpan -TimeSpan $estimatedTimeRemaining
+            $formattedElapsedTime = Format-TimeSpan -TimeSpan $elapsedTime
+            
+            $statusMessage = "$gameName ($index of $total) - $created created, $sanitized sanitized, $skipped skipped, $notFound not found, $errors errors"
+            $progressStatus = "$statusMessage | Elapsed: $formattedElapsedTime | Remaining: $formattedTimeRemaining"
+        } else {
+            $progressStatus = "$gameName ($index of $total)"
+        }
+    } else {
+        $progressStatus = "$gameName ($index of $total) - $created created, $sanitized sanitized, $skipped skipped, $notFound not found, $errors errors"
+    }
+    
+    # Update progress bar
+    Write-Progress -Id 1 -Activity "Scanning Games" -Status $progressStatus -PercentComplete (($index / $total) * 100)
+    
+    #--------------------------------------------------------------------------
+    # Special handling for known problematic games
+    #--------------------------------------------------------------------------
+    
+    $manualExePath = $null
+    
+    # Special case: Elden Ring has a known path structure
+    if ($gameName -eq "ELDEN RING") {
+        $specificPath = "$($folder.FullName)\Game\eldenring.exe"
+        if (Test-Path $specificPath) {
+            Write-Host "Found Elden Ring executable via direct path!" -ForegroundColor Green
+            $manualExePath = $specificPath
+        }
+    }
+    
+    # Add more special cases here as needed:
+    # if ($gameName -eq "SOME OTHER GAME") { ... }
+    
+    #--------------------------------------------------------------------------
+    # Find and process executables
+    #--------------------------------------------------------------------------
+    
+    try {
+        $exeFiles = @()
+        
+        # Use manual path if we have one, otherwise search
+        if ($manualExePath) {
+            $exeFiles = @(Get-Item -Path $manualExePath)
+        } else {
+            # Use our optimized search function
+            $searchStartTime = Get-Date
+            $exeFiles = Find-Executables -folderPath $folder.FullName -maxDepth $maxDepth -gameName $gameName -timeout $folderTimeout
+            $searchTime = (Get-Date) - $searchStartTime
+            
+            # Check if we likely hit a timeout (over 90% of timeout time used)
+            if ($searchTime.TotalSeconds -gt ($folderTimeout * 0.9)) {
+                Write-Host "Warning: $gameName search took $($searchTime.TotalSeconds) seconds" -ForegroundColor Yellow
+                $timeouts++
+                "$gameName - Timeout reached while scanning for executables" | Out-File -FilePath $logErrors -Append
+            }
+        }
+        
+        # Check if we found any executables
+        if ($exeFiles.Count -eq 0) {
+            "$gameName - No executable found" | Out-File -FilePath $logNotFound -Append
+            $notFound++
+            continue
+        }
+        
+        #----------------------------------------------------------------------
+        # Score and select the best executable
+        #----------------------------------------------------------------------
+        
+        # Score all found executables and filter out blocked ones
+        $scored = $exeFiles | ForEach-Object {
+            [PSCustomObject]@{
+                Path  = $_.FullName
+                Score = Get-ExecutableScore -exePath $_.FullName -gameFolderName $gameName
+            }
+        } | Where-Object { $_.Score -ge 0 } | Sort-Object Score -Descending
+        
+        # Check if all executables were blocked by filters
+        if ($scored.Count -eq 0) {
+            "$gameName - No suitable exe (all files blocked by filters)" | Out-File -FilePath $logNotFound -Append
+            
+            # Log what files were found but blocked (for debugging)
+            foreach ($exe in $exeFiles) {
+                "$gameName - Found but filtered: $($exe.FullName) (score would be negative)" | Out-File -FilePath $logBlocked -Append
+            }
+            $notFound++
+            continue
+        }
+        
+        # Select the highest-scoring executable
+        $chosenExe = $scored[0].Path
+        
+        #----------------------------------------------------------------------
+        # Create the shortcut
+        #----------------------------------------------------------------------
+        
+        $shortcutStatus = Create-Shortcut -targetExe $chosenExe -shortcutName $gameName -outputFolder $shortcutOutputFolder
+        
+        # Log the result based on what happened
+        switch ($shortcutStatus) {
+            "created" {
+                "$gameName - $chosenExe" | Out-File -FilePath $logFound -Append
+                $created++
+            }
+            "created_sanitized" {
+                "$gameName - $chosenExe (with sanitized name)" | Out-File -FilePath $logFound -Append
+                $sanitized++
+            }
+            "exists_same" {
+                "$gameName - Shortcut exists and points to same executable: $chosenExe" | Out-File -FilePath $logSkipped -Append
+                $skipped++
+            }
+            "exists_different" {
+                "$gameName - Shortcut exists but points to different executable. New: $chosenExe" | Out-File -FilePath $logSkipped -Append
+                $skipped++
+            }
+            "duplicate" {
+                "$gameName - Duplicate executable already used for: $($createdShortcuts[$chosenExe])" | Out-File -FilePath $logSkipped -Append
+                $skipped++
+            }
+            "error" {
+                "$gameName - Error creating shortcut for: $chosenExe" | Out-File -FilePath $logErrors -Append
+                $errors++
+            }
+        }
+    } catch {
+        # Log any unexpected errors and continue with the next folder
+        Write-Host "Error processing $gameName`: $_" -ForegroundColor Red
+        "$gameName - Error: $_" | Out-File -FilePath $logErrors -Append
+        $errors++
+    }
+}
+
+#==============================================================================
+# COMPLETION AND RESULTS
+#==============================================================================
+
+# Calculate total processing time
+$totalTime = (Get-Date) - $startTime
+$formattedTotalTime = Format-TimeSpan -TimeSpan $totalTime
+
+# Clear progress indicators
+Write-Progress -Id 1 -Activity "Scanning Games" -Completed
+
+# Display results
+Write-Host ""
+Write-Host "==================== SCAN COMPLETE ====================" -ForegroundColor Green
+Write-Host "Done! Shortcuts saved to: $shortcutOutputFolder" -ForegroundColor Green
+Write-Host "Total time: $formattedTotalTime" -ForegroundColor Cyan
+Write-Host "Results: $created created, $sanitized sanitized, $skipped skipped, $notFound not found, $errors errors, $timeouts timeouts" -ForegroundColor White
+Write-Host "See FoundGames.log, NotFoundGames.log, SkippedGames.log, ErrorGames.log, and BlockedFiles.log for details" -ForegroundColor Yellow
+Write-Host ""
+
+# Pause so user can see results before window closes
+Read-Host "Press Enter to exit"
+
+#==============================================================================
+# END OF SCRIPT
+#==============================================================================
